@@ -1,0 +1,23 @@
+{
+  "name": "openai-chatbot-api",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "OpenAI Chatbot API with SQLite storage",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": ["openai", "chatbot", "api", "express"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "openai": "^4.28.0",
+    "better-sqlite3": "^9.4.3",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
