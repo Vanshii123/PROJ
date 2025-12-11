@@ -1,7 +1,7 @@
 import express from 'express';
 import OpenAI from 'openai';
-import Database from 'better-sqlite3';
 import cors from 'cors';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -20,28 +20,49 @@ const client = new OpenAI({
 app.use(cors());
 app.use(express.json());
 
-// Initialize SQLite database
-const db = new Database(join(__dirname, 'messages.db'));
+// JSON file storage
+const DB_PATH = join(__dirname, 'database.json');
 
-// Create tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+// Initialize database
+let db = {
+  conversations: [],
+  messages: []
+};
 
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id INTEGER,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-  );
-`);
+// Load database from file
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const data = fs.readFileSync(DB_PATH, 'utf8');
+      db = JSON.parse(data);
+      console.log('✓ Database loaded');
+    } else {
+      saveDB();
+      console.log('✓ New database created');
+    }
+  } catch (error) {
+    console.error('Error loading database:', error);
+    db = { conversations: [], messages: [] };
+    saveDB();
+  }
+}
 
-console.log('Database initialized');
+// Save database to file
+function saveDB() {
+  try {
+    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+  } catch (error) {
+    console.error('Error saving database:', error);
+  }
+}
+
+// Initialize
+loadDB();
+
+// Generate ID
+function generateId(array) {
+  return array.length > 0 ? Math.max(...array.map(item => item.id)) + 1 : 1;
+}
 
 // POST /message - Send message and get AI response
 app.post('/message', async (req, res) => {
@@ -56,38 +77,57 @@ app.post('/message', async (req, res) => {
 
     // Get or create conversation
     let convId = conversationId;
-    if (!convId) {
-      const result = db.prepare(
-        'INSERT INTO conversations (user_id) VALUES (?)'
-      ).run(userId || 'anonymous');
-      convId = result.lastInsertRowid;
+    let conversation = db.conversations.find(c => c.id === convId);
+    
+    if (!conversation) {
+      convId = generateId(db.conversations);
+      conversation = {
+        id: convId,
+        user_id: userId || 'anonymous',
+        created_at: new Date().toISOString()
+      };
+      db.conversations.push(conversation);
     }
 
     // Save user message
-    db.prepare(
-      'INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)'
-    ).run(convId, 'user', message);
+    const userMsg = {
+      id: generateId(db.messages),
+      conversation_id: convId,
+      role: 'user',
+      content: message,
+      timestamp: new Date().toISOString()
+    };
+    db.messages.push(userMsg);
 
     // Get conversation history
-    const history = db.prepare(
-      'SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC'
-    ).all(convId);
+    const history = db.messages
+      .filter(m => m.conversation_id === convId)
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+      .map(m => ({
+        role: m.role,
+        content: m.content
+      }));
 
     // Call OpenAI API
     const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
-      messages: history.map(msg => ({
-        role: msg.role,
-        content: msg.content
-      }))
+      messages: history
     });
 
     const aiReply = completion.choices[0].message.content;
 
     // Save AI response
-    db.prepare(
-      'INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)'
-    ).run(convId, 'assistant', aiReply);
+    const aiMsg = {
+      id: generateId(db.messages),
+      conversation_id: convId,
+      role: 'assistant',
+      content: aiReply,
+      timestamp: new Date().toISOString()
+    };
+    db.messages.push(aiMsg);
+
+    // Save to disk
+    saveDB();
 
     res.json({
       success: true,
@@ -108,11 +148,11 @@ app.post('/message', async (req, res) => {
 // GET /history/:conversationId - Get conversation history
 app.get('/history/:conversationId', (req, res) => {
   try {
-    const { conversationId } = req.params;
+    const conversationId = parseInt(req.params.conversationId);
 
-    const messages = db.prepare(
-      'SELECT id, role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC'
-    ).all(conversationId);
+    const messages = db.messages
+      .filter(m => m.conversation_id === conversationId)
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
     if (messages.length === 0) {
       return res.status(404).json({ 
@@ -139,22 +179,26 @@ app.get('/conversations', (req, res) => {
   try {
     const userId = req.query.userId || 'anonymous';
 
-    const conversations = db.prepare(`
-      SELECT 
-        c.id,
-        c.created_at,
-        COUNT(m.id) as message_count,
-        MAX(m.timestamp) as last_message
-      FROM conversations c
-      LEFT JOIN messages m ON c.id = m.conversation_id
-      WHERE c.user_id = ?
-      GROUP BY c.id
-      ORDER BY last_message DESC
-    `).all(userId);
+    const userConversations = db.conversations
+      .filter(c => c.user_id === userId)
+      .map(conv => {
+        const convMessages = db.messages.filter(m => m.conversation_id === conv.id);
+        const lastMessage = convMessages.length > 0 
+          ? convMessages[convMessages.length - 1].timestamp 
+          : conv.created_at;
+        
+        return {
+          id: conv.id,
+          created_at: conv.created_at,
+          message_count: convMessages.length,
+          last_message: lastMessage
+        };
+      })
+      .sort((a, b) => new Date(b.last_message) - new Date(a.last_message));
 
     res.json({
       success: true,
-      conversations
+      conversations: userConversations
     });
 
   } catch (error) {
@@ -168,16 +212,20 @@ app.get('/conversations', (req, res) => {
 // DELETE /conversation/:id - Delete a conversation
 app.delete('/conversation/:id', (req, res) => {
   try {
-    const { id } = req.params;
+    const id = parseInt(req.params.id);
 
-    db.prepare('DELETE FROM messages WHERE conversation_id = ?').run(id);
-    const result = db.prepare('DELETE FROM conversations WHERE id = ?').run(id);
-
-    if (result.changes === 0) {
+    const convIndex = db.conversations.findIndex(c => c.id === id);
+    if (convIndex === -1) {
       return res.status(404).json({ 
         error: 'Conversation not found' 
       });
     }
+
+    // Remove conversation and its messages
+    db.conversations.splice(convIndex, 1);
+    db.messages = db.messages.filter(m => m.conversation_id !== id);
+    
+    saveDB();
 
     res.json({
       success: true,
@@ -197,7 +245,11 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    openai: !!process.env.OPENAI_API_KEY
+    openai: !!process.env.OPENAI_API_KEY,
+    stats: {
+      conversations: db.conversations.length,
+      messages: db.messages.length
+    }
   });
 });
 
@@ -206,6 +258,7 @@ app.get('/', (req, res) => {
   res.json({
     name: 'OpenAI Chatbot API',
     version: '1.0.0',
+    status: 'running',
     endpoints: {
       'POST /message': 'Send a message and get AI response',
       'GET /history/:conversationId': 'Get conversation history',
@@ -220,12 +273,13 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📝 OpenAI API Key: ${process.env.OPENAI_API_KEY ? '✓ Configured' : '✗ Missing'}`);
+  console.log(`💾 Database: ${db.conversations.length} conversations, ${db.messages.length} messages`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing database...');
-  db.close();
+  console.log('SIGTERM received, saving database...');
+  saveDB();
   process.exit(0);
 });
 
