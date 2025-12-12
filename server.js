@@ -1,264 +1,188 @@
 import express from 'express';
 import OpenAI from 'openai';
 import cors from 'cors';
-import fs from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize OpenAI
-const client = new OpenAI({ 
-  apiKey: process.env.OPENAI_API_KEY 
-});
+// Initialize OpenAI (will use mock if no key)
+const client = process.env.OPENAI_API_KEY 
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// JSON file storage
-const DB_PATH = join(__dirname, 'database.json');
+// ✅ IN-MEMORY STORAGE - THIS IS CRITICAL
+const conversations = {};
 
-// Initialize database
-let db = {
-  conversations: [],
-  messages: []
-};
-
-// Load database from file
-function loadDB() {
-  try {
-    if (fs.existsSync(DB_PATH)) {
-      const data = fs.readFileSync(DB_PATH, 'utf8');
-      db = JSON.parse(data);
-      console.log('✓ Database loaded');
-    } else {
-      saveDB();
-      console.log('✓ New database created');
-    }
-  } catch (error) {
-    console.error('Error loading database:', error);
-    db = { conversations: [], messages: [] };
-    saveDB();
+// Helper: Get or create conversation
+function getConversation(id) {
+  if (!conversations[id]) {
+    conversations[id] = [];
   }
+  return conversations[id];
 }
 
-// Save database to file
-function saveDB() {
-  try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-  } catch (error) {
-    console.error('Error saving database:', error);
-  }
-}
-
-// Initialize
-loadDB();
-
-// Generate ID
-function generateId(array) {
-  return array.length > 0 ? Math.max(...array.map(item => item.id)) + 1 : 1;
-}
-
-// POST /message - Send message and get AI response
+// ✅ POST /message - STORES MESSAGES + GENERATES REPLY
 app.post('/message', async (req, res) => {
   try {
-    const { message, conversationId, userId } = req.body;
+    const { conversationId, message } = req.body;
 
+    // Validate
+    if (!conversationId) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'conversationId is required' 
+      });
+    }
     if (!message) {
       return res.status(400).json({ 
-        error: 'Message is required' 
+        success: false,
+        error: 'message is required' 
       });
     }
 
-    // Get or create conversation
-    let convId = conversationId;
-    let conversation = db.conversations.find(c => c.id === convId);
-    
-    if (!conversation) {
-      convId = generateId(db.conversations);
-      conversation = {
-        id: convId,
-        user_id: userId || 'anonymous',
-        created_at: new Date().toISOString()
-      };
-      db.conversations.push(conversation);
-    }
+    console.log(`[${conversationId}] Received: ${message}`);
 
-    // Save user message
+    // Get conversation history
+    const conv = getConversation(conversationId);
+
+    // ✅ STEP 1: Store user message
     const userMsg = {
-      id: generateId(db.messages),
-      conversation_id: convId,
       role: 'user',
       content: message,
       timestamp: new Date().toISOString()
     };
-    db.messages.push(userMsg);
+    conv.push(userMsg);
 
-    // Get conversation history
-    const history = db.messages
-      .filter(m => m.conversation_id === convId)
-      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-      .map(m => ({
-        role: m.role,
-        content: m.content
-      }));
+    // ✅ STEP 2: Generate AI reply
+    let aiReply;
+    
+    if (client) {
+      // Real OpenAI call
+      try {
+        const completion = await client.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: conv.map(m => ({ role: m.role, content: m.content }))
+        });
+        aiReply = completion.choices[0].message.content;
+      } catch (error) {
+        console.error('OpenAI error:', error);
+        aiReply = `Error calling OpenAI: ${error.message}`;
+      }
+    } else {
+      // Mock reply (no API key)
+      aiReply = `Echo: ${message} (Mock reply - set OPENAI_API_KEY for real AI)`;
+    }
 
-    // Call OpenAI API
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: history
-    });
-
-    const aiReply = completion.choices[0].message.content;
-
-    // Save AI response
+    // ✅ STEP 3: Store AI reply
     const aiMsg = {
-      id: generateId(db.messages),
-      conversation_id: convId,
       role: 'assistant',
       content: aiReply,
       timestamp: new Date().toISOString()
     };
-    db.messages.push(aiMsg);
+    conv.push(aiMsg);
 
-    // Save to disk
-    saveDB();
+    console.log(`[${conversationId}] Replied. Total messages: ${conv.length}`);
 
+    // ✅ STEP 4: Return response
     res.json({
       success: true,
-      conversationId: convId,
+      conversationId: conversationId,
       reply: aiReply,
-      usage: completion.usage
+      messageCount: conv.length
     });
 
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Error in POST /message:', error);
     res.status(500).json({ 
+      success: false,
       error: 'Failed to process message',
       details: error.message 
     });
   }
 });
 
-// GET /history/:conversationId - Get conversation history
+// ✅ GET /history/:conversationId - RETURNS STORED MESSAGES
 app.get('/history/:conversationId', (req, res) => {
   try {
-    const conversationId = parseInt(req.params.conversationId);
+    const { conversationId } = req.params;
+    const conv = getConversation(conversationId);
 
-    const messages = db.messages
-      .filter(m => m.conversation_id === conversationId)
-      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-
-    if (messages.length === 0) {
-      return res.status(404).json({ 
-        error: 'Conversation not found' 
-      });
-    }
+    console.log(`[${conversationId}] History requested. Messages: ${conv.length}`);
 
     res.json({
       success: true,
-      conversationId,
-      messages
+      conversationId: conversationId,
+      messages: conv,
+      count: conv.length
     });
 
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Error in GET /history:', error);
     res.status(500).json({ 
+      success: false,
       error: 'Failed to retrieve history' 
     });
   }
 });
 
-// GET /conversations - Get all conversations
+// GET /conversations - List all
 app.get('/conversations', (req, res) => {
   try {
-    const userId = req.query.userId || 'anonymous';
-
-    const userConversations = db.conversations
-      .filter(c => c.user_id === userId)
-      .map(conv => {
-        const convMessages = db.messages.filter(m => m.conversation_id === conv.id);
-        const lastMessage = convMessages.length > 0 
-          ? convMessages[convMessages.length - 1].timestamp 
-          : conv.created_at;
-        
-        return {
-          id: conv.id,
-          created_at: conv.created_at,
-          message_count: convMessages.length,
-          last_message: lastMessage
-        };
-      })
-      .sort((a, b) => new Date(b.last_message) - new Date(a.last_message));
+    const list = Object.keys(conversations).map(id => ({
+      conversationId: id,
+      messageCount: conversations[id].length,
+      lastMessage: conversations[id][conversations[id].length - 1]?.timestamp
+    }));
 
     res.json({
       success: true,
-      conversations: userConversations
+      conversations: list,
+      total: list.length
     });
-
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ 
-      error: 'Failed to retrieve conversations' 
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// DELETE /conversation/:id - Delete a conversation
+// DELETE /conversation/:id
 app.delete('/conversation/:id', (req, res) => {
   try {
-    const id = parseInt(req.params.id);
-
-    const convIndex = db.conversations.findIndex(c => c.id === id);
-    if (convIndex === -1) {
-      return res.status(404).json({ 
-        error: 'Conversation not found' 
-      });
+    const { id } = req.params;
+    if (conversations[id]) {
+      delete conversations[id];
+      console.log(`[${id}] Deleted`);
     }
-
-    // Remove conversation and its messages
-    db.conversations.splice(convIndex, 1);
-    db.messages = db.messages.filter(m => m.conversation_id !== id);
-    
-    saveDB();
-
-    res.json({
-      success: true,
-      message: 'Conversation deleted'
-    });
-
+    res.json({ success: true, message: 'Conversation deleted' });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ 
-      error: 'Failed to delete conversation' 
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // Health check
 app.get('/health', (req, res) => {
+  const totalMessages = Object.values(conversations)
+    .reduce((sum, conv) => sum + conv.length, 0);
+
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
     openai: !!process.env.OPENAI_API_KEY,
-    stats: {
-      conversations: db.conversations.length,
-      messages: db.messages.length
+    storage: {
+      conversations: Object.keys(conversations).length,
+      totalMessages: totalMessages
     }
   });
 });
 
-// Root endpoint
+// Root
 app.get('/', (req, res) => {
   res.json({
     name: 'OpenAI Chatbot API',
-    version: '1.0.0',
-    status: 'running',
+    version: '2.0.0',
     endpoints: {
       'POST /message': 'Send a message and get AI response',
       'GET /history/:conversationId': 'Get conversation history',
@@ -269,18 +193,11 @@ app.get('/', (req, res) => {
   });
 });
 
-// Start server
+// Start
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📝 OpenAI API Key: ${process.env.OPENAI_API_KEY ? '✓ Configured' : '✗ Missing'}`);
-  console.log(`💾 Database: ${db.conversations.length} conversations, ${db.messages.length} messages`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, saving database...');
-  saveDB();
-  process.exit(0);
+  console.log(`📝 OpenAI: ${process.env.OPENAI_API_KEY ? '✅ Active' : '❌ Mock mode'}`);
+  console.log(`💾 Storage: In-memory (resets on restart)`);
 });
 
 export default app;
